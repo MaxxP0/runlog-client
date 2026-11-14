@@ -1039,6 +1039,10 @@ COMPACT_MIN_BYTES = int(os.environ.get("RUNLOG_COMPACT_MIN_BYTES", str(1_000_000
 COMPACT_MAX_CHUNKS = max(2, int(os.environ.get("RUNLOG_COMPACT_MAX_CHUNKS", "320")))
 
 HEARTBEAT_SECONDS = 30.0
+# Samples that have waited this long for the uplink are worth one line in the
+# terminal, repeated this often while it lasts.
+SAMPLES_SLOW_AFTER = float(os.environ.get("RUNLOG_SAMPLES_SLOW_AFTER", "120"))
+SAMPLES_SLOW_REPEAT = 900.0
 
 # How often machine telemetry is sampled into system/* series. Sampling shells
 # out to nvidia-smi, so this is deliberately coarser than the flush interval.
@@ -1404,6 +1408,12 @@ class Run:
         self._url_bank: dict[str, tuple[str, float]] = {}   # presigned PUTs, single-use
         self._fail_streak = 0            # consecutive failed flush ticks
         self._fail_last = ""             # last message printed, to suppress repeats
+        self._att_fail_streak = 0        # the same two, for the samples thread
+        self._att_fail_last = ""
+        self._att_waiting_since = 0.0    # when samples began to wait for the uplink
+        self._att_told = 0.0             # when the terminal was last told about it
+        self._att_rate = 0.0             # bytes a second, measured on the last batch
+        self._urls_lock = threading.Lock()
         self._sent: dict[str, int] = {}   # points already shipped, per metric
         self._step = 0
         # Telemetry rides on the training step, but until the first log() there
@@ -1464,9 +1474,20 @@ class Run:
         sys.excepthook = self._excepthook
         self._crash: str = ""
 
+        # Three threads, so that no kind of upload waits for another:
+        #   heartbeat  "the process is alive", every 30 s, whatever else happens;
+        #   runlog     metrics and console, a few KB every few seconds;
+        #   samples    media and histograms, which can be tens of MB per eval.
+        # They used to share one loop. On a slow uplink one eval's audio then
+        # took twenty minutes, during which no point and no heartbeat was sent:
+        # the dashboard showed a healthy run as stale.
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="runlog", daemon=True)
+        self._samples_thread = threading.Thread(target=self._samples_loop, name="runlog-samples", daemon=True)
+        self._beat_thread = threading.Thread(target=self._beat_loop, name="runlog-heartbeat", daemon=True)
         self._thread.start()
+        self._samples_thread.start()
+        self._beat_thread.start()
         atexit.register(self._atexit)
         self._urgent = False
         self._install_signal_handlers()
@@ -1640,8 +1661,10 @@ class Run:
         self._closed = True
         self._stop.set()
         urgent = self._urgent
-        if self._thread.is_alive():
-            self._thread.join(timeout=10 if urgent else PUT_TIMEOUT_MAX + 60)
+        patience = 10 if urgent else PUT_TIMEOUT_MAX + 60
+        for worker in (self._thread, self._samples_thread):
+            if worker.is_alive():
+                worker.join(timeout=patience)
         for watcher, _ in self._watching:
             watcher.close()
         if self._stdout is not None:
@@ -1952,15 +1975,27 @@ class Run:
         megabytes = self._series_bytes / 1_000_000
         return min(MAX_FLUSH_SECONDS, max(MIN_FLUSH_SECONDS, megabytes * 2.0))
 
+    def _beat_loop(self) -> None:
+        """Say that the process is alive, on a thread that does nothing else.
+
+        The dashboard tells a running run from a stale one by this object's
+        age, so it must not wait behind any upload.
+        """
+        while not self._stop.is_set():
+            try:
+                self._refresh_urls_if_needed()
+                _put(self._urls["heartbeat"], b"", "text/plain", timeout=15)
+                self._last_heartbeat = time.time()
+                wait = HEARTBEAT_SECONDS
+            except Exception:
+                wait = 5.0      # said nowhere: the other threads report what is wrong
+            self._stop.wait(wait)
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             self._stop.wait(1.0)
             now = time.time()
             try:
-                if now - self._last_heartbeat >= HEARTBEAT_SECONDS:
-                    self._refresh_urls_if_needed()
-                    _put(self._urls["heartbeat"], b"", "text/plain", timeout=15)
-                    self._last_heartbeat = now
                 # Wait for a real step before sampling: see self._stepped.
                 # Sampling resumes on the very next tick after the first log,
                 # so at most one interval of telemetry is given up.
@@ -1968,13 +2003,6 @@ class Run:
                         and now - self._last_system >= SYSTEM_SAMPLE_SECONDS):
                     self._last_system = now
                     self._record(sample())
-                # Media ships on its own, WITHOUT rewriting the series. These
-                # were coupled, so logging one audio sample forced a full
-                # re-upload of series.json on the next tick — 11 MB at 77k
-                # steps, every time, which saturates the uplink and looks like
-                # the logging call has frozen.
-                if self._media_queue or self._hist_queue:
-                    self._drain_attachments()
                 if now - self._last_flush >= self._flush_interval():
                     self._flush()
                 if self._fail_streak:
@@ -2003,43 +2031,115 @@ class Run:
                           file=sys.__stderr__)
                     self._fail_last = message
 
-    def _drain_attachments(self) -> None:
-        """Upload queued media and histogram snapshots only.
+    def _samples_loop(self) -> None:
+        """Upload media and histograms, apart from everything else.
 
-        Separate from _flush because these are immutable objects — each one is
-        written once — whereas the series is rewritten whole. Coupling them
-        made the cost of logging a sample scale with the length of the run.
+        Samples are the heavy part of a run: one eval can queue tens of MB.
+        On their own thread a slow uplink delays only them.
         """
-        self._refresh_urls_if_needed()
+        while not self._stop.is_set():
+            self._stop.wait(1.0)
+            try:
+                if self._media_queue or self._hist_queue or self._media_dirty or self._hist_dirty:
+                    self._drain_attachments()
+                if self._att_fail_streak:
+                    print(_paint(sys.__stderr__,
+                                 f"runlog: sample uploads recovered after {self._att_fail_streak} "
+                                 f"failed attempt{'s' if self._att_fail_streak > 1 else ''}",
+                                 "green"), file=sys.__stderr__)
+                    self._att_fail_streak, self._att_fail_last = 0, ""
+            except Exception as exc:
+                self._att_fail_streak += 1
+                message = str(exc)
+                if message != self._att_fail_last or self._att_fail_streak in (5, 20, 60, 200):
+                    suffix = (f" (x{self._att_fail_streak}, still retrying)"
+                              if self._att_fail_streak > 1 else " — queued, retrying")
+                    print(_paint(sys.__stderr__,
+                                 f"runlog: sample upload failed ({message}){suffix}", "yellow"),
+                          file=sys.__stderr__)
+                    self._att_fail_last = message
+
+    def _samples_waiting(self) -> None:
+        """Say once, and then every quarter of an hour, that samples are queuing
+        up behind a slow uplink. Without a line in the terminal the only sign
+        is a dashboard that falls behind, and nothing says why."""
         with self._lock:
-            pending, self._media_queue = self._media_queue, []
-            hist_pending, self._hist_queue = self._hist_queue, []
-            media_index = dict(self._media_index) if self._media_dirty else None
-            self._media_dirty = False
-            hist_index = {
-                "steps": list(self._hist_steps), "tensors": list(self._hist_tensors),
-                "kinds": list(self._hist_kinds), "bins": BINS,
-                "truncated": self._hist_truncated,
-            } if self._hist_dirty and self._hist_steps else None
-            self._hist_dirty = False
-        try:
-            if pending:
-                self._upload_media(pending)
-                pending = []
-            if hist_pending:
-                self._upload_histograms(hist_pending)
-                hist_pending = []
-            if media_index is not None:
-                self._put_json(self._urls["media_index"], media_index)
-            if hist_index is not None:
-                self._put_json(self._urls["hist_index"], hist_index)
-        except Exception:
+            count = len(self._media_queue)
+            waiting = sum(len(data) for _, data, _ in self._media_queue)
+        now = time.time()
+        if not count:
+            if self._att_told:
+                print(_paint(sys.__stderr__, "runlog: sample uploads have caught up", "green"),
+                      file=sys.__stderr__)
+            self._att_waiting_since = self._att_told = 0.0
+            return
+        if not self._att_waiting_since:
+            self._att_waiting_since = now
+        if now - self._att_waiting_since < SAMPLES_SLOW_AFTER or now - self._att_told < SAMPLES_SLOW_REPEAT:
+            return
+        self._att_told = now
+        rate = f", at about {self._att_rate / 1000:.0f} KB/s" if self._att_rate else ""
+        print(_paint(sys.__stderr__,
+                     f"runlog: samples are uploading slowly: {count} file{'s' if count != 1 else ''} "
+                     f"({waiting / 1e6:.0f} MB) waiting{rate}. Metrics are not held up.", "yellow"),
+              file=sys.__stderr__)
+
+    def _drain_attachments(self) -> None:
+        """Upload queued media and histogram snapshots, a batch at a time.
+
+        Only the batch being sent leaves the queue. What waits stays where the
+        backlog limit, the end of the run and the next batch can see it; a
+        whole eval used to be taken out at once and was invisible to all three
+        for as long as it took to send.
+        """
+        while not self._stop.is_set():
+            self._refresh_urls_if_needed()
             with self._lock:
-                self._media_queue = pending + self._media_queue
-                self._hist_queue = hist_pending + self._hist_queue
-                self._media_dirty = self._media_dirty or media_index is not None
-                self._hist_dirty = self._hist_dirty or hist_index is not None
-            raise
+                hist_pending, self._hist_queue = self._hist_queue, []
+                pending = self._media_queue[:MEDIA_BATCH]
+                del self._media_queue[:MEDIA_BATCH]
+                hist_index = {
+                    "steps": list(self._hist_steps), "tensors": list(self._hist_tensors),
+                    "kinds": list(self._hist_kinds), "bins": BINS,
+                    "truncated": self._hist_truncated,
+                } if self._hist_dirty and self._hist_steps else None
+                self._hist_dirty = False
+            if not pending and not hist_pending and hist_index is None and not self._media_dirty:
+                self._samples_waiting()
+                return
+            media_index = None
+            try:
+                # Histograms first: a few KB each, and they must not sit behind
+                # an eval's worth of audio.
+                if hist_pending:
+                    self._upload_histograms(hist_pending)
+                    hist_pending = []
+                if hist_index is not None:
+                    self._put_json(self._urls["hist_index"], hist_index)
+                    hist_index = None
+                if pending:
+                    began, size = time.time(), sum(len(data) for _, data, _ in pending)
+                    self._upload_media(pending)
+                    self._att_rate = size / max(0.001, time.time() - began)
+                    pending = []
+                with self._lock:
+                    # The index names only what has landed: a sample still
+                    # waiting would be a tile without a file behind it.
+                    waiting = {name for name, _, _ in self._media_queue}
+                    if self._media_dirty:
+                        media_index = {name: entry for name, entry in self._media_index.items()
+                                       if name not in waiting}
+                    self._media_dirty = bool(waiting)
+                if media_index is not None:
+                    self._put_json(self._urls["media_index"], media_index)
+            except Exception:
+                with self._lock:
+                    self._media_queue = pending + self._media_queue
+                    self._hist_queue = hist_pending + self._hist_queue
+                    self._media_dirty = self._media_dirty or bool(pending) or media_index is not None
+                    self._hist_dirty = self._hist_dirty or hist_index is not None
+                raise
+            self._samples_waiting()
 
     def _flush(self, final: bool = False) -> None:
         self._refresh_urls_if_needed()
@@ -2079,18 +2179,25 @@ class Run:
                 "config": self.config, "summary": dict(self.summary),
                 "metrics": delta,
             }
-            pending, self._media_queue = self._media_queue, []
-            hist_pending, self._hist_queue = self._hist_queue, []
-            hist_index = {
-                "steps": list(self._hist_steps),
-                "tensors": list(self._hist_tensors),
-                "kinds": list(self._hist_kinds),
-                "bins": BINS,
-                "truncated": self._hist_truncated,
-            } if (self._hist_dirty or final) and self._hist_steps else None
-            self._hist_dirty = False
-            media_index = dict(self._media_index) if (self._media_dirty or final) else None
-            self._media_dirty = False
+            # Samples belong to the samples thread. Only the last flush of a
+            # run takes them too: by then that thread has stopped, and what it
+            # left must still go out.
+            pending: list[tuple[str, bytes, str]] = []
+            hist_pending: list[tuple[str, bytes]] = []
+            hist_index = media_index = None
+            if final:
+                pending, self._media_queue = self._media_queue, []
+                hist_pending, self._hist_queue = self._hist_queue, []
+                hist_index = {
+                    "steps": list(self._hist_steps),
+                    "tensors": list(self._hist_tensors),
+                    "kinds": list(self._hist_kinds),
+                    "bins": BINS,
+                    "truncated": self._hist_truncated,
+                } if self._hist_steps else None
+                self._hist_dirty = False
+                media_index = dict(self._media_index)
+                self._media_dirty = False
             # Append-only, exactly like the series. The whole buffer used to be
             # re-uploaded on every flush; with versioning on the bucket, every
             # one of those rewrites is retained forever — 4 GB of dead console
@@ -2287,12 +2394,15 @@ class Run:
     def _refresh_urls_if_needed(self, force: bool = False) -> None:
         if not force and time.time() < self._urls_expire:
             return
-        refreshed = _post(
-            f"{self.base_url}/track/runs/{self.run_id}/urls",
-            {"project": self.project, "media": []}, self.api_key,
-        )
-        self._urls = refreshed["urls"]
-        self._urls_expire = time.time() + refreshed.get("expires_in", 7200) * URL_REFRESH_MARGIN
+        with self._urls_lock:              # three threads ask; one asks the server
+            if not force and time.time() < self._urls_expire:
+                return
+            refreshed = _post(
+                f"{self.base_url}/track/runs/{self.run_id}/urls",
+                {"project": self.project, "media": []}, self.api_key,
+            )
+            self._urls = refreshed["urls"]
+            self._urls_expire = time.time() + refreshed.get("expires_in", 7200) * URL_REFRESH_MARGIN
 
     def _put_json(self, url: str, payload: dict) -> None:
         _put(url, json.dumps(payload, default=str).encode(), "application/json")
