@@ -2699,17 +2699,17 @@ def write_config(url: str | None, key: str | None, read_key: str | None = None) 
 # MARK: - configure
 #
 # `runlog configure`, after `aws configure`: three questions, Enter keeps what
-# is there, the answers go to ~/.runlog.json. A key is never echoed and never
+# is there, the answers go to ~/.runlog.json. A key shows as stars and is never
 # printed in full.
 
 CONFIGURE_HELP = """\
 runlog configure         ask for the server address and the keys, save them in {path}
 runlog configure list    show which address and keys this machine uses, and where each comes from
 
-Enter keeps the value in brackets. A key is not shown while it is typed or
-pasted. Afterwards the server is asked once whether it takes the keys; add
---no-check to skip that. For scripts there are flags instead of questions:
---url URL, --key-stdin, --read-key KEY.
+Enter keeps the value in brackets. A key shows as one star per character
+while it is typed or pasted, never as itself. Afterwards the server is asked
+once whether it takes the keys; add --no-check to skip that. For scripts there
+are flags instead of questions: --url URL, --key-stdin, --read-key KEY.
 """
 
 # A line copied whole from notes or a shell profile is taken for its value.
@@ -2757,12 +2757,122 @@ def _masked(value: str) -> str:
     return "*" * 16 + (value[-4:] if len(value) >= 16 else "")
 
 
+def _skip_escape_sequence(fd: int, select) -> None:
+    """Swallow what follows an Esc byte: an arrow key or a paste marker is a
+    sequence the terminal sent, not something that was typed into the key."""
+    def more() -> bool:
+        return bool(select.select([fd], [], [], 0.05)[0])
+    if not more():
+        return                               # a lone Esc
+    if os.read(fd, 1) not in (b"[", b"O"):
+        return
+    while more():
+        byte = os.read(fd, 1)
+        if not byte or 0x40 <= byte[0] <= 0x7E:
+            return
+
+
+def _read_masked_windows(prompt: str) -> str:
+    import msvcrt
+    for ch in prompt:
+        msvcrt.putwch(ch)
+    chars: list[str] = []
+    while True:
+        ch = msvcrt.getwch()
+        if ch in "\r\n":
+            break
+        if ch == "\x03":
+            msvcrt.putwch("\r"); msvcrt.putwch("\n")
+            raise KeyboardInterrupt
+        if ch in ("\x00", "\xe0"):          # an arrow or function key: two codes
+            msvcrt.getwch()
+            continue
+        if ch == "\x08":
+            if chars:
+                chars.pop()
+                for erase in "\b \b":
+                    msvcrt.putwch(erase)
+            continue
+        if ch < " ":
+            continue
+        chars.append(ch)
+        msvcrt.putwch("*")
+    msvcrt.putwch("\r"); msvcrt.putwch("\n")
+    return "".join(chars)
+
+
+def _read_masked(prompt: str) -> str:
+    """Read a secret from the terminal, showing a star for each character.
+
+    A prompt that shows nothing makes a paste look like it did not happen.
+    Backspace takes a star away and Ctrl-U all of them; the key itself is never
+    on screen.
+    """
+    if os.name == "nt":
+        return _read_masked_windows(prompt)
+    import codecs
+    import select
+    import termios
+    import tty
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        own = True
+    except OSError:
+        fd, own = sys.stdin.fileno(), False
+    out = fd if own else sys.stderr.fileno()
+    try:
+        saved = termios.tcgetattr(fd)
+    except termios.error:
+        if own:
+            os.close(fd)
+        import getpass
+        return getpass.getpass(prompt)       # not a terminal we can drive: no echo at all
+    chars: list[str] = []
+    decode = codecs.getincrementaldecoder("utf-8")("ignore").decode
+    try:
+        tty.setcbreak(fd)                    # one key at a time, unechoed; Ctrl-C still interrupts
+        os.write(out, prompt.encode())
+        while True:
+            data = os.read(fd, 1)
+            if not data:
+                if chars:
+                    break
+                raise EOFError
+            ch = decode(data)
+            if not ch:
+                continue                     # in the middle of a multi-byte character
+            if ch in "\r\n":
+                break
+            if ch == "\x04":                 # Ctrl-D
+                if chars:
+                    break
+                raise EOFError
+            if ch in "\x7f\x08":
+                if chars:
+                    chars.pop()
+                    os.write(out, b"\b \b")
+            elif ch in "\x15\x17":           # Ctrl-U, Ctrl-W: start over
+                os.write(out, b"\b \b" * len(chars))
+                chars.clear()
+            elif ch == "\x1b":
+                _skip_escape_sequence(fd, select)
+            elif ch >= " ":
+                chars.append(ch)
+                os.write(out, b"*")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        os.write(out, b"\n")
+        if own:
+            os.close(fd)
+    return "".join(chars)
+
+
 def _ask(label: str, shown: str, secret: bool) -> str:
     prompt = f"{label} [{shown}]: "
     if sys.stdin.isatty():
         if secret:
-            import getpass
-            return getpass.getpass(prompt)
+            sys.stdout.flush()
+            return _read_masked(prompt)
         return input(prompt)
     # Piped in (a setup script, a test): one answer per line, nothing to hide.
     sys.stdout.write(prompt)

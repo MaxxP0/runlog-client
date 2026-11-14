@@ -46,8 +46,9 @@ wrote /root/.runlog.json (mode 600)
   API key: accepted by runlog.example.com
 ```
 
-It works like `aws configure`. Enter keeps the value in brackets. A key is not
-echoed while it is pasted and is never printed in full. Afterwards the server is
+It works like `aws configure`. Enter keeps the value in brackets. A key shows
+as one star per character while it is typed or pasted, and is never printed in
+full. Afterwards the server is
 asked once whether it takes the keys, which creates nothing.
 
 - `runlog configure list` shows the address and keys this machine uses, and
